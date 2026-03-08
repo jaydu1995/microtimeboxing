@@ -1,10 +1,9 @@
 import { z } from "zod";
 import { createTRPCRouter, protectedProcedure } from "@/lib/trpc";
 import { tasks, buckets } from "@/db/schema";
-import { eq, and } from "drizzle-orm";
+import { eq, and, isNull, isNotNull } from "drizzle-orm"; // added isNull
 
 export const taskRouter = createTRPCRouter({
-  // Get all tasks for a specific bucket
   getByBucket: protectedProcedure
     .input(z.object({ bucketId: z.string().uuid() }))
     .query(async ({ ctx, input }) => {
@@ -21,7 +20,6 @@ export const taskRouter = createTRPCRouter({
         .orderBy(tasks.createdAt);
     }),
 
-  // Get all active tasks for the current user across all buckets
   getAll: protectedProcedure.query(async ({ ctx }) => {
     return ctx.db
       .select()
@@ -30,7 +28,6 @@ export const taskRouter = createTRPCRouter({
       .orderBy(tasks.createdAt);
   }),
 
-  // Pick a random task from a specific bucket
   getRandom: protectedProcedure
     .input(
       z.object({
@@ -47,19 +44,15 @@ export const taskRouter = createTRPCRouter({
             eq(tasks.bucketId, input.bucketId),
             eq(tasks.userId, ctx.userId),
             eq(tasks.isActive, true),
-            // Optionally exclude the default "Open Session" task
+            isNull(tasks.completedAt), // exclude completed tasks
             ...(input.excludeDefault ? [eq(tasks.isDefault, false)] : [])
           )
         );
 
       if (allTasks.length === 0) return null;
-
-      // Pure random selection — equal weight for all tasks
-      const randomIndex = Math.floor(Math.random() * allTasks.length);
-      return allTasks[randomIndex];
+      return allTasks[Math.floor(Math.random() * allTasks.length)];
     }),
 
-  // Pick a random task from a random bucket
   getRandomFromRandomBucket: protectedProcedure
     .input(
       z.object({
@@ -68,7 +61,6 @@ export const taskRouter = createTRPCRouter({
       })
     )
     .query(async ({ ctx, input }) => {
-      // First get all eligible buckets
       const allBuckets = await ctx.db
         .select()
         .from(buckets)
@@ -84,11 +76,9 @@ export const taskRouter = createTRPCRouter({
 
       if (allBuckets.length === 0) return null;
 
-      // Pick a random bucket
       const randomBucket =
         allBuckets[Math.floor(Math.random() * allBuckets.length)];
 
-      // Then get all eligible tasks from that bucket
       const allTasks = await ctx.db
         .select()
         .from(tasks)
@@ -97,23 +87,19 @@ export const taskRouter = createTRPCRouter({
             eq(tasks.bucketId, randomBucket.id),
             eq(tasks.userId, ctx.userId),
             eq(tasks.isActive, true),
+            isNull(tasks.completedAt), // exclude completed tasks
             ...(input.excludeDefaultTask ? [eq(tasks.isDefault, false)] : [])
           )
         );
 
       if (allTasks.length === 0) return null;
 
-      // Pick a random task from that bucket
       const randomTask =
         allTasks[Math.floor(Math.random() * allTasks.length)];
 
-      return {
-        bucket: randomBucket,
-        task: randomTask,
-      };
+      return { bucket: randomBucket, task: randomTask };
     }),
 
-  // Create a new task
   create: protectedProcedure
     .input(
       z.object({
@@ -128,7 +114,6 @@ export const taskRouter = createTRPCRouter({
       })
     )
     .mutation(async ({ ctx, input }) => {
-      // Verify the bucket belongs to this user
       const [bucket] = await ctx.db
         .select()
         .from(buckets)
@@ -154,7 +139,6 @@ export const taskRouter = createTRPCRouter({
       return task;
     }),
 
-  // Update a task
   update: protectedProcedure
     .input(
       z.object({
@@ -178,9 +162,7 @@ export const taskRouter = createTRPCRouter({
         .update(tasks)
         .set({
           ...(input.name && { name: input.name }),
-          ...(input.description !== undefined && {
-            description: input.description,
-          }),
+          ...(input.description !== undefined && { description: input.description }),
           ...(input.minSeconds && { minSeconds: input.minSeconds }),
           ...(input.maxSeconds && { maxSeconds: input.maxSeconds }),
           ...(input.bucketId && { bucketId: input.bucketId }),
@@ -191,8 +173,29 @@ export const taskRouter = createTRPCRouter({
       return updated;
     }),
 
-  // Soft delete
-  delete: protectedProcedure
+  // Mark a task as complete — retires it from random selection
+  complete: protectedProcedure
+    .input(z.object({ id: z.string().uuid() }))
+    .mutation(async ({ ctx, input }) => {
+      const [existing] = await ctx.db
+        .select()
+        .from(tasks)
+        .where(and(eq(tasks.id, input.id), eq(tasks.userId, ctx.userId)));
+
+      if (!existing) throw new Error("Task not found");
+      if (existing.isDefault) throw new Error("Cannot complete the default task");
+
+      const [completed] = await ctx.db
+        .update(tasks)
+        .set({ completedAt: new Date() })
+        .where(and(eq(tasks.id, input.id), eq(tasks.userId, ctx.userId)))
+        .returning();
+
+      return completed;
+    }),
+
+  // Restore a completed task back to active
+  unarchive: protectedProcedure
     .input(z.object({ id: z.string().uuid() }))
     .mutation(async ({ ctx, input }) => {
       const [existing] = await ctx.db
@@ -202,9 +205,39 @@ export const taskRouter = createTRPCRouter({
 
       if (!existing) throw new Error("Task not found");
 
-      if (existing.isDefault) {
-        throw new Error("Cannot delete the default task");
-      }
+      const [restored] = await ctx.db
+        .update(tasks)
+        .set({ completedAt: null })
+        .where(and(eq(tasks.id, input.id), eq(tasks.userId, ctx.userId)))
+        .returning();
+
+      return restored;
+    }),
+
+  getArchived: protectedProcedure.query(async ({ ctx }) => {
+    return ctx.db
+      .select()
+      .from(tasks)
+      .where(
+        and(
+          eq(tasks.userId, ctx.userId),
+          eq(tasks.isActive, true),
+          isNotNull(tasks.completedAt)
+        )
+      )
+      .orderBy(tasks.completedAt);
+  }),
+
+  delete: protectedProcedure
+    .input(z.object({ id: z.string().uuid() }))
+    .mutation(async ({ ctx, input }) => {
+      const [existing] = await ctx.db
+        .select()
+        .from(tasks)
+        .where(and(eq(tasks.id, input.id), eq(tasks.userId, ctx.userId)));
+
+      if (!existing) throw new Error("Task not found");
+      if (existing.isDefault) throw new Error("Cannot delete the default task");
 
       const [deleted] = await ctx.db
         .update(tasks)

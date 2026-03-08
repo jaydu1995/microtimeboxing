@@ -32,6 +32,7 @@ export const tasks = pgTable("tasks", {
   maxSeconds: integer("max_seconds").notNull(),
   isDefault: boolean("is_default").notNull().default(false), // true for "Open Session"
   isActive: boolean("is_active").notNull().default(true),
+  completedAt: timestamp("completed_at"), // null = active, date = retired
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
